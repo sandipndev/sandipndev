@@ -1,6 +1,6 @@
 ### Hola, I'm Sandipan Dey 👋
 
-- 🔭 I’m currently working on QuiVision
+- 🔭 I’m currently working on a lot of things
 - 🌱 I’m currently learning Swift
 - 👯 I’m looking to collaborate on Twitch
 - 🤔 I’m looking for help with Production Pipelines
