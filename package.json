@@ -65,8 +65,8 @@
     "next-themes": "^0.4.6",
     "node-fetch": "^3.3.2",
     "radix-ui": "^1.4.3",
-    "react": "19.1.1",
-    "react-dom": "19.1.1",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
     "react-hook-form": "^7.75.0",
     "react-markdown": "^10.1.0",
     "react-use": "^17.6.0",
@@ -87,8 +87,8 @@
     "@tailwindcss/postcss": "^4.3.0",
     "@tailwindcss/typography": "^0.5.19",
     "@types/node": "^20.19.40",
-    "@types/react": "19.1.14",
-    "@types/react-dom": "19.1.9",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
     "eslint": "^9.39.4",
     "eslint-config-next": "15.5.9",
     "eslint-config-prettier": "^10.1.8",
@@ -98,7 +98,7 @@
     "libphonenumber-metadata-generator": "^1.1.0",
     "lint-staged": "^16.4.0",
     "prettier": "^3.8.3",
-    "prettier-plugin-tailwindcss": "^0.6.14",
+    "prettier-plugin-tailwindcss": "^0.8.0",
     "puppeteer-core": "^24.43.0",
     "rehype-external-links": "^3.0.0",
     "rehype-pretty-code": "^0.14.3",
@@ -119,8 +119,8 @@
     "unist-util-visit": "^5.1.0"
   },
   "resolutions": {
-    "@types/react": "19.1.14",
-    "@types/react-dom": "19.1.9"
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3"
   },
   "engines": {
     "node": "22.x",
