@@ -1,5 +1,5 @@
 {
-  description = "@sandipndev's portfolio";
+  description = "sandipan.dev";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -14,7 +14,8 @@
     (system: let
       overlays = [
         (self: super: {
-          nodejs = super.nodejs_20;
+          nodejs = super.nodejs_22;
+          pnpm = super.pnpm;
         })
       ];
       pkgs = import nixpkgs {
@@ -23,30 +24,14 @@
       nativeBuildInputs = with pkgs;
         [
           alejandra
-          postgresql
-          docker-compose
-          pnpm
           nodejs
-          typescript
-        ]
-        ++ lib.optionals pkgs.stdenv.isDarwin [
-          darwin.apple_sdk.frameworks.SystemConfiguration
+          pnpm
         ];
-      devEnvVars = rec {
-        OTEL_EXPORTER_OTLP_ENDPOINT = http://localhost:4317;
-        PGDATABASE = "pg";
-        PGUSER = "user";
-        PGPASSWORD = "password";
-        PGHOST = "127.0.0.1";
-        DATABASE_URL = "postgres://${PGUSER}:${PGPASSWORD}@${PGHOST}:5433/pg";
-        PG_CON = "${DATABASE_URL}";
-      };
     in
       with pkgs; {
-        devShells.default = mkShell (devEnvVars
-          // {
+        devShells.default = mkShell {
             inherit nativeBuildInputs;
-          });
+          };
 
         formatter = alejandra;
       });

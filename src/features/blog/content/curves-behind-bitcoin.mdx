@@ -1,0 +1,969 @@
+---
+title: curves~behind.bitcoin
+description: a hands-on tour of secp256k1, ecdsa and schnorr signatures
+createdAt: 2026-01-21
+updatedAt: 2026-01-24
+---
+
+Bitcoin isn't "secured by passwords". It's secured by math.  
+And at the center of that math is one of the most elegant structures in cryptography:  
+an [elliptic curve](https://en.wikipedia.org/wiki/Elliptic_curve).
+
+- _What even is a field or a curve?_
+- _How does 256-bit randomness become a public key that nobody can reverse?_
+- _How are signatures used to verify transactions?_
+
+If you're more hands-on you can open this [notebook](/blog/curves-behind-bitcoin/notebook.pdf)
+which has code to follow along.
+
+## Why elliptic curves?
+
+Cryptography needs mathematical structures where certain operations are easy in one direction but practically impossible to reverse. Before elliptic curves, systems like RSA used the difficulty of factoring large numbers. But there's a catch: as computers get faster, you need exponentially larger keys. A 256-bit RSA key is trivially breakable today.
+
+Elliptic curves give us something special: a **group** where the discrete logarithm problem is much harder per bit of key size. A 256-bit elliptic curve key provides roughly the same security as a 3072-bit RSA key. This means:
+
+- Smaller keys (32 bytes vs 384 bytes)
+- Faster operations
+- Smaller signatures
+- Less bandwidth and storage
+
+The "magic" is that while you can efficiently compute $P = dG$ (multiply a point by a scalar), there's no known shortcut to recover $d$ from $P$ and $G$. The group structure scrambles the point through billions of additions in a way that appears random, and unlike integer logarithms, there's no equivalent of a "slide rule" that lets you work backwards.
+
+## From continuous geometry to discrete arithmetic
+
+Bitcoin uses an elliptic curve known as [**secp256k1**](https://www.secg.org/sec2-v2.pdf).
+
+<InfoCollapsible title="Why secp256k1 specifically?">
+
+There are many standardized elliptic curves. NIST recommends P-256, which is widely used in TLS and other protocols. So why did Satoshi choose secp256k1?
+
+1. **Transparency**: The P-256 curve has "magic" constants that NIST never fully explained, leading to speculation about potential backdoors. secp256k1's parameters are more "nothing up my sleeve" — the curve equation $y^2 = x^3 + 7$ uses the simplest non-trivial constants ($a=0$, $b=7$).
+
+2. **Speed**: Because $a=0$ (a Koblitz curve), point addition formulas are simpler and faster. There's no $aX$ term to compute.
+
+3. **Independence**: secp256k1 wasn't designed by any government agency. It was standardized by SECG (Standards for Efficient Cryptography Group) for efficiency, not security theater.
+
+Whether Satoshi deliberately chose it for these reasons or simply picked an available 256-bit curve remains unknown — but the choice has aged well.
+
+</InfoCollapsible>
+
+On a continuous plane (real numbers), it looks like a smooth curve:
+
+$
+y^2 = x^3 + 7
+$
+
+<a href="https://www.desmos.com/calculator/r3ey5sdcwp" target="_blank">
+  <FramedImage
+    src="/blog/curves-behind-bitcoin/curve.png"
+    alt="Elliptic curve y^2 = x^3 + 7 plotted over real numbers"
+    style={{
+      maxHeight: "300px",
+      width: "auto",
+      margin: "0 auto",
+      display: "block",
+    }}
+  />
+</a>
+
+We observe that in an elliptic curve, there are two y-values for a given x.
+This observation will come in handy later.
+
+## Bitcoin curves are modular and discrete
+
+<InfoCollapsible title="What's modular arithmetic?">
+
+**Modular arithmetic** is like a clock: numbers "wrap around" after $n$.
+
+For example, $14 \bmod 12 \equiv 2$ because $14 = 12 + 2$.
+
+</InfoCollapsible>
+
+In Bitcoin, we don’t use real numbers at all.  
+Instead, all numbers live inside a **finite field** — integers modulo a large prime $p$.
+
+A **finite field $\mathbb{F}_p$** (where $p$ is prime) is the set:
+
+$
+\{0, 1, 2, \ldots, p-1\}
+$
+
+where addition, subtraction, multiplication, and division are all done modulo $p$.
+
+### Why must $p$ be prime?
+
+Because when $p$ is prime, every non-zero element in $\mathbb{F}_p$ has a multiplicative inverse:
+
+$
+\forall x \neq 0,\ \exists \space x^{-1} \pmod p
+$
+
+That means division always works.  
+This is what makes $\mathbb{F}_p$ a proper **field** — and elliptic curve formulas rely heavily on division.
+
+### The curve equation modulo $p$
+
+Bitcoin’s curve is not the real-number curve that we drew above $y^2 = x^3 + 7$.  
+It is the _modular_ version:
+
+$
+y^2 \equiv x^3 + 7 \pmod p
+$
+
+That single change — doing everything mod $p$ — completely changes the geometry:
+
+- you only get a finite set of valid integer points $(x, y)$
+- there is no smooth curve anymore
+- arithmetic **wraps around** at $p$
+- there are **no fractional coordinates**
+
+### So what does the curve look like mod $p$?
+
+Instead of a continuous curve, you get a **cloud of discrete points**:
+
+<FramedImage
+  src="/blog/curves-behind-bitcoin/modular-discrete-curves.png"
+  alt="Elliptic curve points plotted over a finite field (discrete modular points)"
+/>
+
+At this point, the curve has boiled down into a finite set of points — and now we can define algebra on them.
+Even though it looks random, this set of points forms a group with a special addition rule.
+That group structure is what Bitcoin uses for public keys and signatures.
+Your public key is in fact, one of those points!
+
+## Terminologies: Curve, Point, and Scalar
+
+To build Bitcoin signatures from scratch, we’ll use a few core objects and operations.
+All of this is discussed in the context of secp256k1.
+
+### 1. Prime field modulus: $p$
+
+All coordinate math is defined over finite field $\mathbb{F}_p$:
+
+- valid coordinates are integers in the range $0 \le x,y < p$
+- arithmetic “wraps around” mod $p$
+
+$p = 2^{256} - 2^{32} - 977$ <br />
+The same can be represented in:
+
+```text
+Hex = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f
+Dec = 115792089237316195423570985008687907853269984665640564039457584007908834671663
+```
+
+### 2. Any point: $P = (x,y)$
+
+A **point** is a pair $(x,y)$ that satisfies the curve equation mod $p$.
+Therefore, it's valid if and only if:
+
+$
+y^2 \equiv x^3 + 7 \pmod p
+$
+
+### 3. Point at infinity: $\mathcal{O}$
+
+There’s a special point called the **point at infinity**, written $\mathcal{O}$.
+It behaves like the identity element of addition:
+
+$
+P + \mathcal{O} = P
+$
+
+### 4. Point addition: $P + Q$
+
+Elliptic curve points can be “added” using a special algebraic rule. This addition has important properties:
+
+- it stays on the curve (closure)
+- it is associative
+- there is an identity element $\mathcal{O}$
+
+This is what makes elliptic curve points form a **group**. The algebraic process graphically is shown below:
+
+<InfoCollapsible title="Why does this 'chord-and-tangent' rule form a group?">
+
+The geometric construction — draw a line through two points, find where it intersects the curve, reflect over the x-axis — seems arbitrary. Why does this give us a valid group operation?
+
+The deep answer involves algebraic geometry, but the intuition is:
+
+1. **Closure**: Any line that intersects an elliptic curve at two points must intersect it at exactly one more point (counting multiplicity and including the point at infinity). This is a property of cubic curves. So $P + Q$ always produces another point on the curve.
+
+2. **The reflection**: We need $P + Q + R = \mathcal{O}$ for the three collinear points. By defining $P + Q$ as $-R$ (the reflection), we get this identity. The reflection ensures that the operation is compatible with the group structure.
+
+3. **Associativity**: This is the hard part to prove and requires careful algebraic verification. It's not obvious geometrically, but it holds.
+
+4. **Identity**: The point at infinity $\mathcal{O}$ acts as identity because a vertical line through $P$ intersects the curve at $P$, $-P$, and $\mathcal{O}$. So $P + (-P) = \mathcal{O}$.
+
+The remarkable fact is that this geometric construction, when translated into coordinate formulas, gives us a group that's perfect for cryptography.
+
+</InfoCollapsible>
+
+<div
+  style={{
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: "1rem",
+    textAlign: "center",
+  }}
+>
+  <div>
+    <strong>P + Q</strong>
+    <FramedImage
+      src="/blog/curves-behind-bitcoin/p-plus-q.png"
+      alt="Addition of two points on the curve"
+      style={{
+        maxHeight: "300px",
+        width: "auto",
+        margin: "0 auto",
+        display: "block",
+      }}
+    />
+  </div>
+  <div>
+    <strong>2P</strong>
+    <FramedImage
+      src="/blog/curves-behind-bitcoin/2-p.png"
+      alt="Doubling a point on the curve"
+      style={{
+        maxHeight: "300px",
+        width: "auto",
+        margin: "0 auto",
+        display: "block",
+      }}
+    />
+  </div>
+</div>
+
+### 5. Point negation / inverse: $-P$
+
+Every point $P=(x,y)$ has an inverse:
+
+$-P = (x, -y \bmod p)$, such that $P + (-P) = \mathcal{O}$
+
+### 6. A scalar: $k$
+
+A **scalar** is just an integer used to repeatedly add a point.
+
+We use scalars in two places:
+
+- mod $p$ for field arithmetic (coordinates and slopes)
+- mod $n$ for group scalars (private keys and signatures)
+
+### 7. Scalar multiplication: $kP$
+
+Scalar multiplication means:
+
+$
+kP = P + P + \cdots + P \quad (k \text{ times})
+$
+
+<InfoCollapsible title="How is this computed efficiently? (Double-and-add)">
+
+Naively adding $P$ to itself $k$ times would require $k$ additions. For a 256-bit $k$, that's up to $2^{256}$ operations — computationally impossible.
+
+The **double-and-add** algorithm reduces this to $O(\log k)$ operations by exploiting binary representation:
+
+1. Write $k$ in binary: e.g., $k = 13 = 1101_2 = 8 + 4 + 1$
+2. So $13P = 8P + 4P + P$
+3. Compute by repeated doubling: $P \to 2P \to 4P \to 8P$, adding when the corresponding bit is 1
+
+```python
+def scalar_mult(k, P):
+    result = O  # point at infinity
+    addend = P
+    while k > 0:
+        if k & 1:  # if lowest bit is 1
+            result = result + addend
+        addend = addend + addend  # double
+        k >>= 1  # shift right
+    return result
+```
+
+For a 256-bit scalar, this requires at most 256 doublings and 256 additions — a few hundred operations instead of $2^{256}$.
+
+This is analogous to fast exponentiation (square-and-multiply) for integers.
+
+</InfoCollapsible>
+
+This is the core operation behind Bitcoin keys:
+
+- easy to compute forward
+- hard to undo (discrete log problem)
+
+<InfoCollapsible title="Why is the discrete log problem hard?">
+
+Given $P = kG$, why can't we just "divide" to find $k$?
+
+The intuition is that scalar multiplication **scrambles** the point through the group in a way that destroys any pattern. Think of it like this: starting from $G$, each addition moves you to a seemingly random next point. After $k$ additions, you're at some point $P$ — but the path you took leaves no trace.
+
+With regular integers, if you know $g^k = h$, you can use clever algorithms (like baby-step giant-step or index calculus) to find $k$ efficiently. But elliptic curve groups lack the algebraic structure that makes these shortcuts work. The best known algorithms for ECDLP are generic group attacks like Pollard's rho, which require $O(\sqrt{n})$ operations — about $2^{128}$ for secp256k1.
+
+To put this in perspective: there are roughly $2^{256}$ possible private keys. Even if you could check a trillion keys per second, checking $2^{128}$ of them would take longer than the age of the universe.
+
+This is why we say secp256k1 provides **128-bit security**: breaking it requires approximately $2^{128}$ operations, which is the standard security target for modern cryptography. The "256" in secp256k1 refers to the key size, but the actual security level is half that due to the square-root attacks.
+
+</InfoCollapsible>
+
+### 8. Generator point: $G$
+
+The generator point $G$ is a fixed point on the curve chosen by the standard. It generates the subgroup used in Bitcoin.
+
+```text
+Gx = 55066263022277343669578718895168534326250603453777594175500187360389116729240
+Gy = 32670510020758816978083085130507043184471273380659243275938904335757337482424
+```
+
+In practice, **private key** is a scalar $d$ while **public key** is the point $P = dG$.
+
+### 9. Group order: $n$
+
+If you add $G$ to itself $n$ times, you get the identity point.
+
+$nG = \mathcal{O}$
+
+The number $n$ is called the **order of the subgroup generated by $G$**.
+
+```text
+Hex = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141
+Dec = 115792089237316195423570985008687907852837564279074904382605163141518161494337
+```
+
+Bitcoin requires scalars to be in this range, $1 \le d \le n-1$ and most signature math happens modulo $n$.
+
+<InfoCollapsible title="Why is p ≠ n?">
+
+This is a common source of confusion. We have two large primes:
+
+- $p$ — the field modulus (for coordinates)
+- $n$ — the group order (for scalars)
+
+They're different because not every possible $(x, y)$ pair in $\mathbb{F}_p \times \mathbb{F}_p$ lies on the curve. The number of actual points on the curve is $n$, which is close to $p$ but not equal.
+
+For secp256k1: $p - n \approx 2^{128}$, which seems large but is tiny compared to both numbers ($\approx 2^{256}$).
+
+This relationship is governed by Hasse's theorem, which bounds how far $n$ can be from $p$:
+
+$$|n - (p + 1)| \le 2\sqrt{p}$$
+
+The consequence is that coordinate arithmetic uses mod $p$, while private key and signature arithmetic uses mod $n$. Mixing them up is a common bug in implementations.
+
+</InfoCollapsible>
+
+## Generating a Public/Private Keypair
+
+**Private Key**: Any scalar $1 \le d \le n-1$<br />
+**Corresponding public key**: $P = dG$, a point on the secp256k1 curve.
+
+```python
+d = secrets.randbelow(n)
+P = d * G
+```
+
+This operation is easy to compute, but hard to reverse.
+Mathematically, given $P$ and $G$, it's infeasible to compute $d$, where $P = dG$.
+
+### SEC1 Public Key Serialization (used in ECDSA)
+
+The points are generated modulo $p$ which is in 256 bits or 32 bytes.
+Therefore, `x` or `y` coordinate values will be of 32 bytes.
+
+#### Uncompressed Serialization (65 bytes)
+
+```text
+04 || x(32 bytes) || y(32 bytes)
+```
+
+#### Compressed Serialization (33 bytes)
+
+For a given x, there can be ONLY two values of y, because $y = \pm\sqrt{x^3+7}$
+
+```text
+(03|02) || x(32 bytes)
+
+03 = odd y
+02 = even y
+```
+
+### BIP340 X-Only Public Key Serialization (used in Schnorr/Taproot)
+
+BIP340 enforces a canonical rule:
+
+> The public key point is always interpreted as the point with even $y$
+
+Thereby, if public key $P = dG$ has an odd y value ($P.y$ is odd),
+then the private key is negated to $d' = n - d$, giving $P' = d'G = -P$ which has even $y$.
+
+<InfoCollapsible title="Why the even-y convention?">
+
+Every x-coordinate on the curve has exactly two valid y-values: one even, one odd (they're negatives of each other mod $p$). This creates ambiguity: which point does a given x represent?
+
+BIP340 resolves this by **always** choosing the even $y$. This gives us:
+
+1. **Canonical representation**: No ambiguity. Given just $x$, there's exactly one valid point.
+
+2. **Space savings**: We only need to transmit 32 bytes (just $x$) instead of 33 bytes (prefix + $x$).
+
+3. **No malleability**: In ECDSA, you could flip the sign of a point and create an alternate valid signature. With the even-$y$ rule, there's only one valid form.
+
+The cost is that signers must adjust their private key if their public key has odd $y$ — but this is just a negation, which is trivial.
+
+</InfoCollapsible>
+
+The serialization here will only be the x value, so **32 bytes**.
+
+```text
+x(32 bytes)
+```
+
+## Elliptic Curve Digital Signature Algorithm (ECDSA)
+
+ECDSA is the signature scheme Bitcoin used from day one (and it’s still widely used today).
+It lets you prove:
+
+> I know the private key $d$ corresponding to public key $P=dG$,<br />
+> without revealing $d$.
+
+### ECDSA Signing Algorithm
+
+The signer has:
+
+- Private Key $d$
+- Public Key $P = dG$
+- Message Hash $z$ (For Bitcoin, this is the transaction sighash)
+
+The signature is the pair $(r, s)$
+
+**_Step 1_: Generate a secret nonce $k$**
+
+$k \in [1, n-1]$ - $k$ must be unpredictable - $k$ must never repeat - $k$ must remain secret
+
+In production Bitcoin, this is done deterministically using RFC6979 $k = f(d, z)$
+
+**_Step 2_: Compute the nonce point $R$**
+
+$R = kG$
+
+Take its x-coordinate:
+$r = R_x \bmod n$
+
+**_Step 3_: Compute the signature scalar $s$**
+
+The signing formula is:
+
+$s = k^{-1}(z + rd) \bmod n$
+
+The final ECDSA signature is:
+$(r, s)$
+
+<InfoCollapsible title="Why is this formula mathematically 'unclean'?">
+
+Look at where each value comes from:
+
+- $k$ is a **scalar** (random nonce in $\mathbb{Z}_n$)
+- $z$ is a **scalar** (message hash truncated to $n$ bits)
+- $d$ is a **scalar** (private key in $\mathbb{Z}_n$)
+- $r$ is... complicated. It's derived as $r = R_x \bmod n$ where $R = kG$ is a **point**
+
+The problem is $r$. We're taking a point $R$ (a group element), extracting its x-coordinate (a field element in $\mathbb{F}_p$), and then reducing it mod $n$ to get a scalar.
+
+This is a **domain crossing**: group → field → scalar.
+
+Since $p \neq n$ (for secp256k1, $p > n$ by a small margin), values in the range $[n, p-1]$ wrap around when reduced mod $n$.
+This means there's a tiny subset of x-coordinates that "collide" with smaller values, breaking the clean 1-to-1 correspondence.
+
+In practice, this range is negligible ($p - n \approx 2^{128}$ is tiny compared to $n \approx 2^{256}$), but it makes the formula mathematically impure — you're mixing operations from different algebraic structures in a way that loses some information.
+
+Schnorr signatures avoid this by using $r_x$ directly without the mod $n$ reduction, and building the challenge hash differently.
+
+</InfoCollapsible>
+
+```python
+def ecdsa_sign(z: int, d: int, G: Point) -> Tuple[int, int]:
+    """
+    Sign a message hash interpreted as integer z.
+    Returns (r, s) as integers in [1, n-1].
+    """
+    n = G.curve.n
+
+    if n is None:
+        raise ValueError("Curve must have order n")
+    if not (1 <= d < n):
+        raise ValueError("Invalid private key d")
+
+    z = z % n # message should also be mod n
+
+    while True:
+        # Random Nonce is fine for learning but not production
+        # because what if nonce reused because of randomness?
+        # k = secrets.randbelow(n)
+
+        # RFC6979 Deterministic Nonce
+        k = rfc6979_generate_nonce(d, z, n)
+
+        R = k * G
+        if R.is_infinity(): continue
+
+        r = R.x % n
+        if r == 0: continue
+
+        k_inv = Scalar(k, n).inv().value
+        s = (k_inv * (z + r * d)) % n
+        if s == 0: continue
+
+        # The signature is NOT a point, just a pair of values
+        return (r, s)
+```
+
+### ECDSA Verification Algorithm
+
+The verifier has:
+
+- signature $(r,s)$
+- message hash $z$
+- public key $P$
+
+They want to verify the signature without knowing $d$.
+
+**_Step 1_: Range checks**
+
+- $r \in [1, n-1]$
+- $s \in [1, n-1]$
+
+Otherwise reject
+
+**_Step 2_: Compute inverse of $s$**
+
+$w = s^{-1} \bmod n$
+
+**_Step 3_: Compute two scalars**
+
+$u_1 = zw \bmod n$
+$u_2 = rw \bmod n$
+
+**_Step 4_: Reconstruct the point $X$**
+
+$X = u_1G + u_2P$
+
+Reject if $X = \mathcal{O}$.
+
+**_Step 5_: Compare x-coordinate**
+
+$v = X_x \bmod n$
+
+The signature is valid iff $v = r$
+
+```python
+def ecdsa_verify(z: int, sig: Tuple[int, int], P: Point, G: Point) -> bool:
+    """
+    Verify ECDSA signature (r,s) for message hash integer z against public key P.
+    """
+    r, s = sig
+    n = G.curve.n
+    if n is None:
+        raise ValueError("Curve must have order n")
+
+    if P.is_infinity() or (P.curve != G.curve):
+        return False
+    if not (1 <= r < n and 1 <= s < n):
+        return False
+
+    z = z % n # message should be mod n
+
+    s_inv = Scalar(s, n).inv().value
+
+    u1 = (z * s_inv) % n
+    u2 = (r * s_inv) % n
+
+    X = (u1 * G) + (u2 * P)
+    if X.is_infinity():
+        return False
+
+    return (X.x % n) == r
+```
+
+<InfoCollapsible title="Why does ECDSA Verification Work (Proof)">
+
+$s=k^{-1}(z+rd) \bmod n$ <br/>
+$\Rightarrow ks=z+rd \bmod n$ <br />
+$\Rightarrow k=s^{-1}(z+rd) \bmod n$ <br />
+$\Rightarrow k=w(z+rd) \bmod n$ <br />
+$\Rightarrow k=zw+rdw \bmod n$ <br />
+Substituting $u_1 = zw, u_2=rw$,
+
+$k=u_1+u_2d \bmod n$ <br />
+$\Rightarrow kG=(u_1+u_2d)G \bmod n$ <br />
+$\Rightarrow kG=u_1G+u_2(dG) \bmod n$ <br />
+$\Rightarrow kG=u_1G+u_2P \bmod n$ <br />
+
+</InfoCollapsible>
+
+### ECDSA Problems
+
+Bitcoin, historically, had to deal with two classes of problems.
+
+#### 1. Nonce reuse leaks the private key
+
+$s=k^{-1}(z+rd) \bmod n$ <br/>
+$\Rightarrow sk = z+rd \bmod n$ <br/>
+
+Now, suppose you sign $s_1$ and $s_2$ with the same nonce $k$.
+
+$s_1k = z_1 + rd \bmod n$<br />
+$s_2k = z_2 + rd \bmod n$
+
+Subtract:
+
+$(s_1-s_2)k = (z_1-z_2) \bmod n$<br />
+$\implies k = (z_1-z_2)(s_1-s_2)^{-1} \bmod n$ <br/>
+
+And once $k$ is known,
+
+Private Key $d = (sk - z)r^{-1} \bmod n$
+
+##### Why Deterministic Nonces?
+
+If $k$ is generated randomly, even a tiny flaw in the RNG (biased bits, predictable state, or VM snapshot reuse) can leak the private key.
+RFC6979 removes this risk entirely by deriving $k$ deterministically from the private key and message: $k = f(d, z)$.
+
+This means:
+
+- Same $(d, z)$ always produces the same $k$ — no randomness needed
+- Different messages produce different $k$ values — no reuse
+- The nonce is unpredictable to attackers who don't know $d$
+
+<InfoCollapsible title="Real-world nonce disasters">
+
+This isn't theoretical — nonce failures have caused real catastrophes:
+
+**PlayStation 3 (2010)**: Sony used ECDSA to sign PS3 game software, but their implementation used the same nonce $k$ for every signature. The hacking group fail0verflow recovered Sony's private key and published it, allowing anyone to sign homebrew software as "official." Sony's entire code-signing infrastructure was compromised.
+
+**Android Bitcoin Wallets (2013)**: A weakness in Android's `SecureRandom` caused some Bitcoin wallet apps to generate predictable nonces. Attackers monitored the blockchain for signatures with repeated $r$ values (which implies repeated $k$), extracted private keys, and stole the funds. Multiple users lost Bitcoin before the bug was patched.
+
+**Biased Nonces**: Even a tiny bias in nonce generation (say, the top 4 bits are always zero) can leak the private key after enough signatures. Researchers have demonstrated key recovery from as few as a few hundred signatures with subtly biased nonces.
+
+These incidents are why RFC6979 (deterministic nonces) became the industry standard.
+
+</InfoCollapsible>
+
+#### 2. Signature Malleability
+
+If $(r,s)$ is a valid ECDSA signature, then $(r, n-s)$ is also valid.
+
+```python
+r, s = sig = ecdsa_sign(z, d, G)
+
+assert ecdsa_verify(z, (r, s), P, G) # expected to pass
+assert ecdsa_verify(z, (r, n - s), P, G) # NO ERROR!
+```
+
+### Reasons Bitcoin moved away from ECDSA (towards Schnorr / Taproot)
+
+#### 1. Transaction ID Malleability: _(pre- SegWit)_
+
+Before SegWit, the transaction ID was computed as:
+$txid = sha256d(\text{serialized-transaction})$
+
+and the serialization included `scriptSig`, which contains the signature bytes.
+So any mutation to signature bytes could change the txid even though the spend remained valid.
+
+##### a) DER encoding malleability (non-canonical encodings)
+
+- The same mathematical ECDSA signature (r, s) could be encoded in multiple valid (but non-canonical) ways in DER
+- This allowed third parties to mutate signature bytes, and therby mutate txid
+
+It was fixed by BIP66 (Strict DER encoding) (consensus rule).
+
+##### b) s-value malleability (high-s / low-s)
+
+For any valid signature (r,s), this is also valid: (r, n - s)
+
+This produces a different signature that still verifies, again allowing txid mutation pre-SegWit.
+
+Mitigated by enforcing low-S signatures as policy/standardness (often discussed in context of BIP62), and later enforced more strictly for SegWit spends.
+
+##### c) SegWit solved it structurally
+
+SegWit moved signatures into the witness, so:
+
+- txid no longer commits to signatures
+- malleability no longer breaks txid-based chaining
+
+Fixed by SegWit (BIP141) at the protocol level.
+
+#### 2. Nonce Fragility / Leaking Private Key (discussed above)
+
+#### 3. No clean key aggregation
+
+ECDSA's multiplicative structure ($s = k^{-1}(z + rd)$) doesn't compose nicely. If Alice and Bob want to create a joint signature, they can't simply add their individual signatures together.
+
+Schnorr's linear structure ($s = k + ed$) is fundamentally different. If Alice signs with $s_1 = k_1 + e \cdot d_1$ and Bob signs with $s_2 = k_2 + e \cdot d_2$, then $s_1 + s_2 = (k_1 + k_2) + e(d_1 + d_2)$ is a valid signature for the aggregated key $(d_1 + d_2)G = P_1 + P_2$.
+
+This linearity enables protocols like MuSig2, where multiple parties can create a single signature that's indistinguishable from a regular signature — enabling efficient multisig, atomic swaps, and more.
+
+#### 4. Additional malleability vectors
+
+Beyond the $(r, n-s)$ malleability discussed above, ECDSA has other subtle malleability issues:
+
+- The same $(r, s)$ values can sometimes be valid for different messages if $r$ values collide after mod $n$ reduction (extremely rare but theoretically possible)
+- Implementation bugs around DER encoding created additional attack surface
+
+Schnorr's design eliminates these by construction: the even-$y$ requirement and the way the challenge hash commits to the full message remove ambiguity.
+
+#### 5. No efficient batch verification
+
+When a Bitcoin node receives a block with hundreds of transactions, it must verify hundreds of signatures. With ECDSA, each verification requires separate elliptic curve operations.
+
+Schnorr verification is a linear equation: check that $sG = R + eP$, or equivalently, $sG - eP - R = \mathcal{O}$.
+
+For multiple signatures, you can combine these checks:
+$$\sum_i (s_i G - e_i P_i - R_i) = \mathcal{O}$$
+
+With random coefficients (to prevent cancellation attacks), this becomes a single multi-scalar multiplication — which is much faster than $n$ separate verifications. Batch verification can speed up block validation by 2-3x.
+
+<br />
+
+## Schnorr Signatures (BIP340)
+
+Schnorr signatures are what Bitcoin uses for Taproot outputs.
+They are cleaner, more structured, and more composable.
+
+<InfoCollapsible title="Why wasn't Schnorr used from day one?">
+
+Schnorr signatures were invented by Claus-Peter Schnorr in 1989 — nearly two decades before Bitcoin. They're simpler, more efficient, and have better security proofs than ECDSA. So why did Satoshi use ECDSA instead?
+
+**Patents**. Schnorr patented his signature scheme (US Patent 4,995,082), which expired in February 2008 — the same year Bitcoin's whitepaper was published. By the time Bitcoin launched in January 2009, the patent had just expired.
+
+However, during those 20 years of patent protection, the cryptographic community had already standardized on ECDSA as the patent-free alternative. It was implemented everywhere: OpenSSL, hardware security modules, government standards. Satoshi likely chose ECDSA because it was the battle-tested, readily available option.
+
+It took until 2021 (Taproot activation) for Bitcoin to finally adopt Schnorr — 12 years after the patent expired. The delay was due to the careful, conservative nature of Bitcoin protocol changes, not technical limitations.
+
+</InfoCollapsible>
+
+Schnorr signatures look like: $(r_x, s)$
+
+where:
+
+- $r_x$ is the x-coordinate of nonce point $R$
+- $s$ is a scalar modulo $n$
+
+### Schnorr Signing Algorithm
+
+The signer has:
+
+- Private Key $d$
+- Public Key $P = dG$
+- Message $m$ (32 bytes)
+
+**_Step 1_: Compute public key and enforce even-y**
+
+$P = dG$
+
+If $P_y$ is odd, replace $d \leftarrow n-d$ and $P \leftarrow -P$ so that $P_y$ is always even.
+
+**_Step 2_: Generate nonce $k$ deterministically**
+
+BIP340 uses tagged hashes with optional aux randomness: $k = f(d, m, aux)$
+
+<InfoCollapsible title="What does aux randomness protect against?">
+
+The `aux` parameter (32 bytes of randomness) might seem redundant — after all, deterministic nonces are already safe, right?
+
+The protection is against **side-channel attacks**. When a device computes the nonce deterministically from $(d, m)$, an attacker with physical access might:
+
+- Measure power consumption during the computation
+- Analyze electromagnetic emissions
+- Time how long operations take
+
+These attacks can potentially leak bits of the secret key over many signatures.
+
+By XORing fresh randomness into the nonce derivation, each signing operation looks different even for the same message. An attacker can't correlate multiple measurements, because the `aux` value changes unpredictably.
+
+Crucially, `aux` doesn't need to be secret or even high-quality random — it just needs to be different each time. Even if an attacker learns `aux`, they still can't compute the nonce without knowing $d$. It's defense in depth: the signature is secure even if `aux` is compromised, but `aux` makes side-channel attacks much harder.
+
+</InfoCollapsible>
+
+**_Step 3_: Compute nonce point $R$**
+
+$R = kG$
+
+If $R_y$ is odd, replace $k \leftarrow n-k$ and $R \leftarrow -R$ so that $R_y$ is always even.
+
+**_Step 4_: Compute challenge $e$**
+
+$e = H(r_x, p_x, m) \bmod n$
+
+**_Step 5_: Compute signature scalar $s$**
+
+$s = k + ed \bmod n$
+
+The Schnorr signature is $(r_x, s)$, serialized as
+
+```text
+rx(32 bytes) || s(32 bytes)
+```
+
+### Schnorr Verification Algorithm
+
+The verifier has:
+
+- x-only public key $p_x$
+- signature $(r_x, s)$
+- message $m$
+
+**_Step 1_: Range checks**
+
+- $r_x \in [0, p-1]$
+- $s \in [0, n-1]$
+
+**_Step 2_: Lift x-only public key**
+
+Compute $P = lift\_x(p_x)$: solve $y^2 \equiv x^3 + 7 \pmod p$ and choose the even $y$.
+
+<InfoCollapsible title="How does lift_x compute the square root?">
+
+Given $x$, we need to find $y$ such that $y^2 \equiv x^3 + 7 \pmod p$.
+
+First, compute $c = x^3 + 7 \bmod p$. Then we need $\sqrt{c} \bmod p$.
+
+For secp256k1, there's a shortcut: since $p \equiv 3 \pmod 4$, the square root is simply:
+
+$$y = c^{(p+1)/4} \bmod p$$
+
+This works because:
+
+- $y^2 = c^{(p+1)/2} = c^{(p-1)/2} \cdot c = c$ (by Fermat's little theorem, $c^{(p-1)/2} \equiv 1$ for quadratic residues)
+
+If $c$ has no square root (not a quadratic residue), this formula produces a value that doesn't satisfy $y^2 = c$, which we detect and reject.
+
+Once we have $y$, we check if it's even. If not, we use $p - y$ instead (the other root, which is odd if $y$ is even, since $p$ is odd).
+
+For primes where $p \equiv 1 \pmod 4$, the more complex Tonelli-Shanks algorithm is needed, but secp256k1's $p$ was chosen partly for this computational convenience.
+
+</InfoCollapsible>
+
+**_Step 3_: Compute challenge**
+
+$e = H(r_x, p_x, m) \bmod n$
+
+**_Step 4_: Reconstruct nonce point**
+
+$R' = sG - eP$
+
+Reject if $R' = \mathcal{O}$.
+
+**_Step 5_: Final checks**
+
+Signature is valid iff $R'_y$ is even and $R'_x = r_x$.
+
+<InfoCollapsible title="Why does Schnorr Verification Work (Proof)">
+
+From signing: $s = k + ed \bmod n$
+
+Multiply by $G$: $sG = (k+ed)G = kG + e(dG) = R + eP$
+
+Rearrange: $R = sG - eP$
+
+So the verifier reconstructs exactly the same $R$.
+
+</InfoCollapsible>
+
+<InfoCollapsible title="Why does this prove knowledge of the private key?">
+
+The signature protocol is an instance of the **Fiat-Shamir heuristic** — a way to turn an interactive proof into a non-interactive one.
+
+The interactive version works like this:
+
+1. **Commit**: Prover sends $R = kG$ (committing to a random nonce)
+2. **Challenge**: Verifier sends a random challenge $e$
+3. **Respond**: Prover sends $s = k + ed$
+
+The verifier checks $sG = R + eP$. If the prover doesn't know $d$, they're stuck: they committed to $R$ before seeing $e$, so they can't craft an $s$ that works for the challenge they didn't predict.
+
+In the non-interactive version, the challenge is derived from the commitment itself: $e = H(R_x, P_x, m)$. The hash function acts as an unpredictable "virtual verifier" — the prover can't predict what challenge they'll get until they've already committed to $R$.
+
+This is why the signature proves knowledge: you can only produce a valid $(R, s)$ pair if you know $d$, because you need to respond to a challenge you couldn't predict when you made your commitment.
+
+</InfoCollapsible>
+
+<InfoCollapsible title="Why can't you forge by choosing s first?">
+
+A natural question: why can't an attacker just pick a random $s$, compute $R' = sG - eP$, and claim $(R'_x, s)$ as their signature?
+
+The problem is **circular dependency**. The challenge $e$ is computed as:
+
+$$e = H(R_x, P_x, m)$$
+
+So $e$ depends on $R_x$. But if you're trying to compute $R'$ from $s$ and $e$, you need to know $e$ first. And you can't know $e$ until you know $R_x$. And you can't know $R_x$ until you compute $R' = sG - eP$. But that requires knowing $e$...
+
+You're stuck in a loop. The only way out is to either:
+
+1. Know the private key $d$ (so you can compute $R = kG$ first, then derive $e$, then compute $s$)
+2. Find a hash collision or preimage (break the hash function)
+
+This circular dependency is the core of why Schnorr signatures are unforgeable under the random oracle model.
+
+</InfoCollapsible>
+
+You can take a look at the implementation of Schnorr Signatures in the [notebook](/blog/curves-behind-bitcoin/notebook.pdf).
+
+### Tagged Hashes in BIP340
+
+BIP340 uses tagged hashes for domain separation:
+
+- `BIP0340/aux`
+- `BIP0340/nonce`
+- `BIP0340/challenge`
+
+$$H_{tag}(x) = sha256(sha256(tag) \| sha256(tag) \| x)$$
+
+<InfoCollapsible title="What is domain separation and why does it matter?">
+
+**Domain separation** ensures that hash values computed for one purpose can never accidentally (or maliciously) be valid for another purpose.
+
+Imagine if the nonce hash and challenge hash used the same function without tags. An attacker might find an input that produces the same hash value in both contexts, potentially creating subtle vulnerabilities.
+
+By prefixing each hash with a unique tag, we create effectively **different hash functions** for each use case:
+
+- A hash computed with `BIP0340/nonce` can never equal one computed with `BIP0340/challenge`
+- Even if the input data is identical, the outputs are completely different
+
+The double-hashing of the tag ($sha256(tag) \| sha256(tag)$) is an optimization: implementations can precompute this 64-byte prefix and reuse it, since SHA-256 processes 64 bytes at a time.
+
+This pattern is a cryptographic best practice that prevents entire classes of attacks where values "cross over" between different protocol contexts.
+
+</InfoCollapsible>
+
+### Schnorr vs ECDSA: No Malleability
+
+In ECDSA, $(r, s)$ and $(r, n-s)$ both verify.
+
+In BIP340 Schnorr, signatures are canonicalized using the even-$y$ requirement on $R$, so the "flip $s$" trick does not produce a second valid signature.
+
+## A Note on Quantum Computing
+
+Everything in this post assumes classical computers. A sufficiently powerful **quantum computer** running Shor's algorithm could solve the discrete log problem in polynomial time, breaking ECDSA and Schnorr alike.
+
+How worried should we be?
+
+- **Current state**: As of 2026, the largest quantum computers have a few thousand qubits. Breaking secp256k1 would require millions of stable, error-corrected qubits.
+- **Timeline estimates**: Experts disagree wildly — some say 10 years, others say 30+, some say never at scale.
+- **Bitcoin's exposure**: Only public keys that have been revealed (by spending) are vulnerable. Addresses that have never spent are protected by the hash function layer (RIPEMD160 + SHA256), which quantum computers don't break as efficiently.
+- **Mitigation**: Post-quantum signature schemes exist (lattice-based, hash-based) and could be added to Bitcoin via soft fork if quantum computers become a real threat.
+
+The cryptographic community is actively researching post-quantum alternatives, but for now, elliptic curves remain secure against all known attacks.
+
+## Takeaways
+
+The security of Bitcoin rests on a beautiful mathematical foundation: the difficulty of reversing scalar multiplication on elliptic curves. From a 256-bit random number (your private key), we derive a public key that's trivial to compute but impossible to reverse. Signatures prove you know the private key without revealing it, using the clever trick of committing to randomness before being challenged.
+
+ECDSA served Bitcoin well for over a decade, but its multiplicative structure created subtle problems: fragile nonces, signature malleability, and no path to aggregation. Schnorr's linear design ($s = k + ed$) elegantly solves these issues while enabling new capabilities like efficient multisig and batch verification.
+
+**Key concepts**:
+
+- $\mathbb{F}_p$ for coordinates/slopes, $\mathbb{Z}_n$ for private keys/signature scalars
+- Modular inverse exists for all non-zero values in both fields
+- A point has a group inverse $-P$, not a modular inverse
+- Recovering $d$ from $P=dG$ is the Elliptic Curve Discrete Log Problem (infeasible)
+- ECDSA nonce failure is catastrophic (leaks private key)
+- Schnorr signatures are smaller, canonical, and better for aggregation
+- Tagged hashes provide domain separation
+- `aux` is signer-only randomness to harden nonce generation
