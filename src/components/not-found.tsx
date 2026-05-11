@@ -15,11 +15,11 @@ export function NotFound({ className }: { className?: string }) {
       <svg
         className="h-28 w-full text-border"
         xmlns="http://www.w3.org/2000/svg"
-        viewBox="0 0 514 258"
+        viewBox="0 0 512 256"
         fill="none"
       >
         <path
-          d="M65 193v64h128v-64H65Zm0 0H1V65h64m0 128V65m384 0H321v128h128m0-128V1H257v256h192v-64m0-128v128m0-128h64v128h-64M65 65h128V1H65v64Z"
+          d="M448 64H320V192H448V256H256V0H448V64ZM512 192H448V64H512V192Z M64 0H193V64H64V0Z M64 64H0V176H128V256H193V112H64V64ZM80 224H0V256H80V224Z"
           stroke="currentColor"
           strokeWidth="1"
           vectorEffect="non-scaling-stroke"
